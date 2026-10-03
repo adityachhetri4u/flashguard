@@ -24,10 +24,9 @@ def reserve_inventory(db: Session, request: ReserveRequest) -> Reservation:
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # Sync Redis inventory if not present (only first time)
+    # Sync Redis inventory if not present (only first time) atomically
     inventory_key = f"product:{request.product_id}:inventory"
-    if redis_client.get(inventory_key) is None:
-        redis_client.set(inventory_key, product.available_inventory)
+    redis_client.setnx(inventory_key, product.available_inventory)
 
     # 3. Perform atomic reservation in Redis
     reservation_id = str(uuid.uuid4())
