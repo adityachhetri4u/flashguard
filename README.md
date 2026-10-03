@@ -1,92 +1,102 @@
-# FlashGuard — Distributed Flash-Sale Inventory & Order System
+# FlashGuard: Distributed Flash-Sale System
 
-## 1. What FlashGuard is
-FlashGuard is a technically correct distributed flash-sale inventory and order system. It is designed to handle extremely high concurrency scenarios where thousands of users attempt to purchase a very limited number of items simultaneously.
+![FlashGuard](https://img.shields.io/badge/Status-Completed-brightgreen) ![Concurrency](https://img.shields.io/badge/Concurrency-10k_Users-blue) ![Stack](https://img.shields.io/badge/Stack-FastAPI%20%7C%20Redis%20%7C%20PostgreSQL-blueviolet)
 
-## 2. The Problem Being Solved
-When a popular item goes on flash sale (e.g., 100 smartphones, 10,000 users), standard e-commerce implementations fail because they suffer from race conditions. This often results in overselling (selling more units than actually exist in inventory) or database deadlocks.
+FlashGuard is a highly concurrent, distributed e-commerce ordering system built to handle extreme traffic spikes—such as selling 100 smartphones to 10,000 eager buyers within seconds. 
 
-FlashGuard solves this by decoupling high-speed inventory reservation from durable order processing, guaranteeing that inventory never becomes negative.
+The system guarantees **zero overselling**, handles **partial failures**, guarantees **idempotency**, and ensures strict **inventory consistency** even under extreme DDoS-level request bursts.
 
-## 3. Architecture
-The system uses a React frontend, a FastAPI backend, Redis for atomic high-speed inventory reservation, PostgreSQL for durable source of truth, and a background worker for timeout recovery. See `docs/architecture.md` for a detailed breakdown.
+## 🚀 Quick Start (How to Run)
 
-## 4. Technology Stack
-- **Frontend**: React, Vite, Tailwind CSS, Axios
-- **Backend**: Python 3.11, FastAPI, SQLAlchemy, Pydantic
-- **Database**: PostgreSQL
-- **Cache & Concurrency**: Redis (Lua Scripts)
-- **Infrastructure**: Docker & Docker Compose
+The entire application (Frontend, Backend, Redis, PostgreSQL, and Background Worker) is containerized.
 
-## 5. Database Model
-- **Product**: Details about the flash sale item, including total and available inventory.
-- **Reservation**: Tracks the temporary holding of inventory with an idempotency key and expiration timestamp.
-- **Order**: Created alongside a reservation, tracks the final purchase state and total amount.
-- **Payment**: Tracks the outcome of the payment simulation.
+**Prerequisites:** Docker and Docker Compose.
 
-## 6. Reservation Flow
-1. User requests to buy a product, sending an idempotency key.
-2. Backend validates product existence.
-3. Backend executes a Lua script in Redis to atomically check inventory, check idempotency, and decrement inventory.
-4. If successful, durable records (Reservation & Order) are created in PostgreSQL.
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/adityachhetri4u/flashguard.git
+   cd flashguard
+   ```
 
-## 7. State Machine
-**Order States:**
-- `PAYMENT_PENDING` -> `CONFIRMED`
-- `PAYMENT_PENDING` -> `PAYMENT_FAILED` (Releases Inventory)
-- `PAYMENT_PENDING` -> `PAYMENT_TIMEOUT`
-- `PAYMENT_PENDING` -> `CANCELLED`
+2. **Start the system**
+   ```bash
+   docker-compose up -d --build
+   ```
 
-**Reservation States:**
-- `RESERVED` -> `CONFIRMED`
-- `RESERVED` -> `EXPIRED` (Worker releases inventory)
-- `RESERVED` -> `CANCELLED`
+3. **Access the Application**
+   - **Frontend UI:** `http://localhost:5173`
+   - **Backend API Docs:** `http://localhost:8000/docs`
+   - **Admin Metrics API:** `http://localhost:8000/api/admin/metrics`
 
-## 8. Idempotency Strategy
-The client sends an `idempotency_key` with every purchase request. Redis checks if this key exists using the Lua script. If it does, the backend fetches the existing order from PostgreSQL rather than consuming more inventory.
+4. **Run the Load Test (Optional)**
+   You can simulate a 10,000-user flash sale using the provided Python scripts in the `load_tests/` directory.
+   ```bash
+   pip install -r load_tests/requirements.txt
+   python load_tests/flash_sale_200.py --csv-file load_tests/flashguard_10000_buyers_product16.csv --product-id 16
+   ```
 
-## 9. Redis's Role
-Redis is purely used for the hot path: atomic inventory decrements using Lua scripts. It prevents race conditions during the initial burst of traffic.
+---
 
-## 10. PostgreSQL's Role
-PostgreSQL is the durable source of truth. It stores all final states. If Redis data is lost, PostgreSQL retains the actual orders and remaining inventory can be re-calculated or synced.
+## 🧠 The Problem & Domain
 
-## 11. Payment Simulation
-A simulated payment endpoint (`/api/orders/{order_id}/pay`) allows simulating `SUCCESS`, `FAILED`, and `TIMEOUT` scenarios to observe how the system handles state transitions and inventory recovery.
+In a flash sale, thousands of users attempt to purchase a highly limited item at the exact same millisecond. Traditional database setups fail here due to:
+- **Database Lock Contention:** 10,000 threads trying to acquire a row lock on a single inventory record will crash the database or timeout.
+- **Race Conditions (Overselling):** If read and write operations aren't perfectly atomic, the system will sell units that don't exist.
+- **Lost Updates & Retries:** Users experiencing network lag will click "Buy" multiple times, resulting in duplicate charges or duplicate inventory deductions.
 
-## 12. Reservation Expiration
-A background worker continuously scans PostgreSQL for `RESERVED` reservations where `expires_at` has passed. It changes their status to `EXPIRED` and atomically restores the inventory both in PostgreSQL and Redis.
+**The Absolute Business Rule:** The system must *never* sell more units than actually exist.
 
-## 13. How to Run Locally
-Run the entire stack using Docker Compose:
-```bash
-docker compose up --build
-```
-- Frontend: http://localhost:5173
-- Backend API: http://localhost:8000
-- API Docs: http://localhost:8000/docs
+---
 
-**Steps to start:**
-1. Run `docker compose up --build -d`
-2. Open the Frontend.
-3. Go to Admin Dashboard (top right) and click **Seed / Reset Data**.
-4. Go back to the Store and try purchasing.
+## 🏗️ Solution Architecture & Approach
 
-## 14. Environment Variables
-See `.env.example`:
-- `DATABASE_URL`: PostgreSQL connection string.
-- `REDIS_URL`: Redis connection string.
-- `VITE_API_URL`: Backend API URL for the frontend.
+To solve this, FlashGuard decouples the initial traffic burst from the durable database using an **In-Memory Gatekeeper pattern**.
 
-## 15. API Endpoints
-- `GET /api/products`
-- `GET /api/products/{id}`
-- `GET /api/products/{id}/inventory`
-- `POST /api/orders/reserve`
-- `POST /api/orders/{id}/pay`
-- `GET /api/orders/{id}`
-- `POST /api/orders/{id}/cancel`
-- `GET /api/reservations/{id}`
-- `GET /api/admin/metrics`
-- `POST /api/admin/seed`
-- `GET /api/health`
+### 1. The Gatekeeper (Redis)
+All incoming purchase requests first hit a single-threaded Redis instance running an atomic **Lua Script**. 
+- The script checks idempotency (has this user already requested this?).
+- It checks if `inventory > 0`.
+- If valid, it decrements the inventory entirely in memory and returns success.
+- **Result:** Over 9,900 excess requests are instantly rejected (`400 OUT_OF_STOCK`) in microseconds without ever touching PostgreSQL.
+
+### 2. Durable Persistence (PostgreSQL)
+Only the successfully admitted requests (the 100 winners) proceed to PostgreSQL. 
+- The backend acquires a safe row lock, deducts the inventory atomically (`available_inventory >= request.quantity`), and writes the `Reservation` and `Order`. 
+- Even if Redis goes out of sync, PostgreSQL's strict SQL constraints act as the ultimate source of truth, making overselling mathematically impossible.
+
+### 3. Background Expiry Worker
+A background Python daemon constantly polls for `Reservation` records that have expired (e.g., users who reserved but abandoned the checkout). It atomically cancels the order and restores the inventory to both PostgreSQL and Redis.
+
+---
+
+## 🔄 State Machine & Transitions
+
+The lifecycle of an order rigorously follows this state machine:
+
+`AVAILABLE` ➔ `RESERVED` ➔ `PAYMENT_PENDING` ➔ `CONFIRMED`
+
+| State | Trigger | Action | Failure Handling |
+|-------|---------|--------|------------------|
+| **AVAILABLE** | User clicks "Buy" | Redis Lua atomic decrement. | If Redis fails/restarts, initializes via `setnx` from DB. |
+| **RESERVED** | Redis approves | Insert DB Reservation. | If DB insert fails, TTL expires in Redis automatically. |
+| **PAYMENT_PENDING** | DB Flush succeeds | Insert DB Order. | If user drops off, Background Worker expires after 10 mins. |
+| **CONFIRMED** | Payment success | Update DB statuses. | Idempotency key prevents duplicate payment processing. |
+
+---
+
+## 🛡️ Handling Edge Cases & Failures
+
+- **Thousands of concurrent requests:** Handled by increasing the `uvicorn` and PostgreSQL connection pools (`pool_size=250`) and using Redis to absorb 90% of the read/write load.
+- **Duplicate client requests (Retries):** The Redis Lua script stores an `idempotency_key` upon successful reservation. If the same request arrives again, the script returns `-1`, and the API fetches the existing reservation instead of deducting new inventory.
+- **Service Crashes:** If the API crashes after Redis deducts inventory but before PostgreSQL writes the reservation, the Redis idempotency key will eventually expire (TTL), or the Background Worker will reconcile the state.
+- **Redis Initialization Race Condition:** If Redis restarts, the first thousands of requests could theoretically reset the inventory multiple times. This is mitigated by using the atomic `SETNX` command to load inventory from PostgreSQL only if the key strictly does not exist.
+
+---
+
+## 🔮 Limitations & Future Improvements
+
+While this system handles 10,000 concurrent requests smoothly, further scaling would require:
+
+1. **Message Queues (Kafka/RabbitMQ):** Instead of FastAPI synchronously writing to PostgreSQL after Redis approval, it should push the valid reservation to a message queue. This would return a response to the user instantly ("You're in line!") and workers would insert into PostgreSQL at their own pace, preventing DB connection pool exhaustion entirely.
+2. **Redis Cluster:** The current setup relies on a single Redis node. For higher availability, a Redis Cluster or Sentinel setup should be used to prevent a single point of failure.
+3. **Multiple Warehouses:** Currently, inventory is pooled into one counter. To support multiple warehouses, the Lua script could dynamically route checks to specific warehouse keys based on user geography.
